@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>星路引 V9.5 - 严格启动布局版</title>
+    <!-- Tailwind CSS for mobile aesthetics -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Firebase/Firestore Modules -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, setDoc, deleteDoc, onSnapshot, collection, serverTimestamp, setLogLevel, query, orderBy, limit } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        setLogLevel('Debug');
+
+        // --- GLOBAL STATE AND DATA ---
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        let guides = []; 
+        let currentGuide = null; 
+        let currentView = 'ASSESSMENT'; // Default start view after login/load
+        
+        // Firestore Path Variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        
+        let discussions = [];
+
+        // 12 Sample Assessment Questions (Scoring: 1=偶尔, 2=有时, 3=经常)
+        const assessmentQuestions = [
+            "1. 孩子是否难以理解他人的非语言暗示（如面部表情、手势）？",
+            "2. 孩子在同龄人社交互动中是否显得退缩或不感兴趣？",
+            "3. 孩子是否对特定声音、光线或质地表现出强烈或异常的反应？",
+            "4. 孩子是否表现出重复的身体动作或刻板行为（如摇晃、拍手）？",
+            "5. 孩子在需要想象力的游戏或活动中是否感到困难？",
+            "6. 孩子在日常例行程序改变时是否会表现出极度不安？",
+            "7. 孩子在表达自己的需求或情感时，是否使用重复或非功能性的语言？",
+            "8. 孩子是否难以维持眼神交流或进行目光接触？",
+            "9. 孩子是否沉迷于特定物品或主题，并表现出强烈的专注力？",
+            "10. 孩子在需要协作或轮流的活动中，是否难以参与？",
+            "11. 孩子是否拥有超越同龄人的某些机械记忆能力？",
+            "12. 孩子是否对疼痛或温度等刺激表现出异常的低反应？"
+        ];
+        
+        // --- FIRESTORE UTILS ---
+        function getGuidesCollectionRef() {
+            if (!db || !userId) return null;
+            return collection(db, `artifacts/${appId}/users/${userId}/star_guides`);
+        }
+        
+        function getDiscussionCollectionRef() {
+            if (!db) return null;
+            return collection(db, `artifacts/${appId}/public/data/discussions`);
+        }
+
+        // --- FIREBASE INITIALIZATION & AUTH ---
+        try {
+            if (Object.keys(firebaseConfig).length > 0) {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                    } else {
+                        await signInAnonymously(auth);
+                        userId = auth.currentUser.uid;
+                    }
+                    isAuthReady = true;
+                    setupFirestoreListeners();
+                });
+
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                }
+
+            } else {
+                console.error('Firebase config is missing.');
+            }
+        } catch (error) {
+            console.error('Firebase initialization failed:', error);
+        }
+
+        // --- FIRESTORE LISTENERS ---
+        function setupFirestoreListeners() {
+            const guidesRef = getGuidesCollectionRef();
+            if (guidesRef) {
+                onSnapshot(guidesRef, (snapshot) => {
+                    guides = snapshot.docs.map(doc => ({
+                        id: doc.id,
+                        ...doc.data()
+                    })).sort((a, b) => (b.updated_at?.toMillis() || 0) - (a.updated_at?.toMillis() || 0));
+                    
+                    document.getElementById('loading-state').style.display = 'none';
+
+                    if (!currentGuide && guides.length > 0) {
+                        loadGuide(guides[0].id);
+                    } else if (!currentGuide) {
+                        // Show the dedicated launch screen
+                         updateAppLayout(false); 
+                    }
+                    
+                    renderGuideList();
+                    if (currentGuide && !guides.some(g => g.id === currentGuide.id)) {
+                        clearGuideView();
+                    }
+                }, (error) => {
+                    console.error(`加载失败: ${error.message}`);
+                });
+            }
+            
+            // Discussion Listener setup here (omitted for brevity, assume it works)
+            const discussionRef = getDiscussionCollectionRef();
+            if (discussionRef) {
+                const q = query(discussionRef, orderBy('timestamp', 'desc'), limit(20));
+                onSnapshot(q, (snapshot) => {
+                    discussions = snapshot.docs.map(doc => ({
+                        id: doc.id,
+                        ...doc.data(),
+                        displayTime: doc.data().timestamp ? new Date(doc.data().timestamp.toMillis()).toLocaleString() : '刚刚'
+                    }));
+                    if (currentView === 'DISCUSSION') {
+                        renderDiscussion(document.getElementById('content-area-main'));
+                    }
+                }, (error) => {
+                    console.error("加载讨论区失败:", error);
+                });
+            }
+        }
+        
+        // --- APP FLOW AND UI CONTROL ---
+
+        function updateAppLayout(isLaunched) {
+            const mainHeader = document.getElementById('app-main-header');
+            const mainContent = document.getElementById('app-main-content-wrapper');
+            const mainNav = document.getElementById('app-main-nav');
+            const launchScreen = document.getElementById('launch-screen');
+
+            if (isLaunched) {
+                // Show main app UI
+                mainHeader.classList.remove('hidden');
+                mainContent.classList.remove('hidden');
+                mainNav.classList.remove('hidden');
+                launchScreen.classList.add('hidden');
+            } else {
+                // Show launch screen UI (50/50)
+                mainHeader.classList.add('hidden');
+                mainContent.classList.add('hidden');
+                mainNav.classList.add('hidden');
+                launchScreen.classList.remove('hidden');
+            }
+        }
+
+        window.loadGuide = function(guideId) {
+            const guide = guides.find(g => g.id === guideId);
+            if (!guide) return;
+            currentGuide = guide;
+            document.getElementById('profile-creation-modal').classList.add('hidden');
+            updateAppLayout(true); // Switch to main app layout
+            switchView('ASSESSMENT'); 
+            renderGuideList();
+        }
+        
+        window.clearGuideView = function() {
+            currentGuide = null;
+            updateAppLayout(false); // Switch back to launch screen
+            document.getElementById('content-area-main').innerHTML = '';
+            renderGuideList();
+        }
+
+        function updateDisplayArea(guide) {
+            const mainQuote = document.getElementById('main-quote');
+            const quoteSource = document.getElementById('quote-source');
+            const progressContainer = document.getElementById('progress-container');
+
+            if (!guide) {
+                // Should not happen when in main view, but safety first
+                mainQuote.textContent = '欢迎来到星路引';
+                quoteSource.textContent = '您的育儿成长助手。';
+                progressContainer.classList.add('hidden');
+            } else {
+                const quote = guide.quote || '专注当下，成就未来';
+
+                mainQuote.textContent = quote;
+                quoteSource.textContent = `档案: ${guide.name || '未命名'} | ${guide.age || '?'}岁, ${guide.province || '未知省份'}`;
+                progressContainer.classList.remove('hidden');
+                
+                // Progress bar update logic (omitted for brevity, same as previous version)
+                const progress = guide.progress || 0;
+                const progressText = document.getElementById('progress-text-main');
+                const progressBar = document.getElementById('progress-bar-main');
+                if (progressText) progressText.textContent = `${progress}%`;
+                if (progressBar) progressBar.style.width = `${progress}%`;
+                let color = 'bg-gray-400';
+                if (progress >= 100) color = 'bg-purple-400';
+                else if (progress >= 75) color = 'bg-green-400';
+                else if (progress >= 40) color = 'bg-yellow-400';
+                else color = 'bg-red-400';
+                if (progressBar) progressBar.className = `progress-bar h-1.5 rounded-full ${color}`;
+            }
+        }
+        
+        window.switchView = function(viewName) {
+            if (!currentGuide && viewName !== 'DISCUSSION') {
+                updateAppLayout(false); // Go back to launch screen if no profile selected
+                return;
+            }
+
+            currentView = viewName;
+            document.querySelectorAll('.nav-button').forEach(btn => {
+                btn.classList.remove('bg-blue-600', 'text-white');
+                btn.classList.add('text-gray-500', 'bg-white');
+            });
+            document.getElementById(`nav-${viewName.toLowerCase()}`).classList.add('bg-blue-600', 'text-white');
+            document.getElementById(`nav-${viewName.toLowerCase()}`).classList.remove('text-gray-500', 'bg-white');
+            
+            const contentArea = document.getElementById('content-area-main');
+            contentArea.innerHTML = ''; 
+
+            updateDisplayArea(currentGuide);
+
+            switch (viewName) {
+                case 'ASSESSMENT':
+                    renderAssessment(contentArea);
+                    break;
+                case 'DAILY_LOG':
+                    renderDailyLog(contentArea);
+                    break;
+                case 'DISCUSSION':
+                    renderDiscussion(contentArea);
+                    break;
+                case 'PRO_SERVICE':
+                    renderProService(contentArea);
+                    break;
+            }
+        }
+        
+        // --- MODULE RENDERING ---
+
+        // Assessment Module
+        function renderAssessment(container) {
+            const hasResult = currentGuide.lastAssessmentScore !== undefined && currentGuide.lastAssessmentScore !== null;
+            
+            let assessmentContent = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">🧠 测评模块 (${currentGuide.name}档案)</h2>
+                
+                ${hasResult ? `
+                    <div class="p-4 mb-6 bg-green-100 rounded-xl shadow-md border-l-4 border-green-500">
+                        <h3 class="text-xl font-bold text-green-700 mb-2">📊 上次测评结果回顾</h3>
+                        <p class="text-sm mt-1 leading-relaxed">上次得分: ${currentGuide.lastAssessmentScore || 0}分。点击下方按钮进行复测。</p>
+                        <button onclick="showAssessmentResultModal(generateSimpleResultObject(${currentGuide.lastAssessmentScore || 0}, ${assessmentQuestions.length * 3}))" 
+                                class="mt-3 py-1 px-4 bg-green-500 text-white rounded-full text-xs hover:bg-green-600 transition">
+                            查看详细结果
+                        </button>
+                    </div>
+                ` : `
+                    <div class="p-4 mb-6 bg-yellow-100 rounded-xl shadow-md border-l-4 border-yellow-500">
+                        <h3 class="text-xl font-bold text-yellow-700 mb-2">开始首次测评 (12题)</h3>
+                        <p class="text-sm">请仔细阅读以下测评题，根据孩子的行为频率进行打分。</p>
+                    </div>
+                `}
+
+                <!-- Assessment Questions Form -->
+                <form id="assessment-form" class="space-y-4">
+                    ${assessmentQuestions.map((q, index) => `
+                        <div class="p-4 bg-white rounded-lg shadow-sm border border-gray-200">
+                            <label class="block text-sm font-semibold text-gray-700 mb-3">${q}</label>
+                            <div class="flex justify-between space-x-2 text-center text-xs">
+                                <label class="flex-1 p-2 border rounded-full hover:bg-red-50 transition cursor-pointer">
+                                    <input type="radio" name="q${index}" value="3" required> 经常 (3分)
+                                </label>
+                                <label class="flex-1 p-2 border rounded-full hover:bg-yellow-50 transition cursor-pointer">
+                                    <input type="radio" name="q${index}" value="2" required> 有时 (2分)
+                                </label>
+                                <label class="flex-1 p-2 border rounded-full hover:bg-green-50 transition cursor-pointer">
+                                    <input type="radio" name="q${index}" value="1" required> 偶尔 (1分)
+                                </label>
+                            </div>
+                        </div>
+                    `).join('')}
+                    
+                    <button type="submit" class="w-full py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg hover:bg-blue-700 transition">
+                        提交测评得分
+                    </button>
+                    <div class="text-sm text-center mt-2 text-gray-500" id="assessment-status"></div>
+                </form>
+            `;
+            container.innerHTML = assessmentContent;
+            document.getElementById('assessment-form').addEventListener('submit', handleAssessmentSubmit);
+        }
+
+        // Generate Result Object
+        function generateSimpleResultObject(score, maxScore) {
+            const thresholdHigh = Math.ceil(maxScore * 0.7); 
+            const thresholdMedium = Math.ceil(maxScore * 0.4); 
+            
+            let level, resultText, guidanceText;
+            
+            if (score >= thresholdHigh) {
+                level = "挑战关注级";
+                resultText = "评估显示孩子的挑战行为频率较高，可能存在社交、沟通或行为模式上的显著差异。需结合环境因素和医院诊断进行综合判断。";
+                guidanceText = "建议：**立即寻求专业机构评估**。日常以结构化教学和明确指令为主，多进行眼神交流和轮流游戏训练。";
+            } else if (score >= thresholdMedium) {
+                level = "发展观察级";
+                resultText = "孩子表现出中度挑战，集中在特定情境或兴趣上。环境适应性和同伴交往是关键。这可能受家庭或教育环境影响。";
+                guidanceText = "建议：**加强情景模拟和情绪理解训练**。尝试小步快跑原则，奖励积极行为，并建立稳定的作息。";
+            } else {
+                level = "常规发展级";
+                resultText = "孩子行为总体稳定，挑战行为较少。日常关注点在于促进更丰富、灵活的社交互动和兴趣发展。";
+                guidanceText = "建议：**继续保持观察记录**。鼓励孩子参与更复杂的集体活动，拓展新的爱好，提升其主动沟通意愿。";
+            }
+            
+            return { score, maxScore, level, resultText, guidanceText };
+        }
+
+        // Assessment Result Modal Handler
+        window.showAssessmentResultModal = function(result) {
+            const modal = document.getElementById('assessment-result-modal');
+            
+            document.getElementById('result-score').textContent = `${result.score} / ${result.maxScore} 分`;
+            document.getElementById('result-level').textContent = result.level;
+            document.getElementById('result-summary').innerHTML = `【概要】${result.resultText}`;
+            document.getElementById('result-guidance').innerHTML = `【指导】${result.guidanceText}`;
+
+            modal.classList.remove('hidden');
+        }
+        
+        async function handleAssessmentSubmit(event) {
+            event.preventDefault();
+            const form = event.target;
+            let totalScore = 0;
+            let allAnswered = true;
+            const status = document.getElementById('assessment-status');
+            status.textContent = '正在计算得分...';
+
+            for (let i = 0; i < assessmentQuestions.length; i++) {
+                const selector = `input[name="q${i}"]:checked`;
+                const input = form.querySelector(selector);
+                if (input) {
+                    totalScore += parseInt(input.value, 10);
+                } else {
+                    allAnswered = false;
+                    break;
+                }
+            }
+
+            if (!allAnswered) {
+                status.textContent = '⚠️ 请完成全部12道题后提交。';
+                status.classList.add('text-red-500');
+                return;
+            }
+            
+            const resultData = generateSimpleResultObject(totalScore, assessmentQuestions.length * 3);
+
+            // Save the score to Firestore
+            const data = { 
+                lastAssessmentScore: totalScore, 
+                assessmentDate: serverTimestamp(),
+                progress: Math.min(currentGuide.progress || 0, 25) + 25 
+            };
+            const guideDocRef = doc(getGuidesCollectionRef(), currentGuide.id);
+
+            try {
+                await setDoc(guideDocRef, data, { merge: true });
+                currentGuide.lastAssessmentScore = totalScore; 
+                currentGuide.progress = data.progress; // Update local state
+                
+                status.textContent = '✅ 得分保存成功！';
+                
+                // CRITICAL: Show the result modal immediately
+                showAssessmentResultModal(resultData);
+                
+                // Re-render assessment view in the background to show history
+                switchView('ASSESSMENT'); 
+
+            } catch (error) {
+                status.textContent = `❌ 保存失败: ${error.message}`;
+            }
+        }
+
+        // Daily Log Module (Supports Text, Mocking Image/Voice)
+        function renderDailyLog(container) {
+             container.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">📝 每日记录 (${currentGuide.name}档案)</h2>
+                
+                <div class="p-4 mb-4 bg-white rounded-xl shadow-md border-l-4 border-orange-500">
+                    <h3 class="text-xl font-semibold mb-2">记录今天的进展</h3>
+                    
+                    <div class="flex space-x-3 mb-4">
+                        <button class="flex-1 py-2 bg-gray-100 text-gray-700 rounded-lg border hover:bg-gray-200 transition">🖼️ (功能占位) 上传图片</button>
+                        <button class="flex-1 py-2 bg-gray-100 text-gray-700 rounded-lg border hover:bg-gray-200 transition">🎤 (功能占位) 录制语音</button>
+                    </div>
+
+                    <p class="text-gray-600 text-sm mb-2">文本记录：</p>
+                    <textarea id="daily-log-input" rows="4" placeholder="记录今天的关键事件、情绪、干预反馈..." class="w-full p-2 border border-gray-300 rounded-lg mb-2 focus:ring-orange-500"></textarea>
+                    <button onclick="saveDailyLog()" class="w-full py-2 bg-orange-500 text-white font-bold rounded-lg hover:bg-orange-600">
+                        提交记录
+                    </button>
+                    <div id="log-status" class="text-sm text-center mt-2 text-gray-500"></div>
+                </div>
+                
+                <h3 class="text-xl font-bold text-gray-700 mt-6 mb-3">📄 报告与进展</h3>
+                <div class="space-y-4">
+                    <div class="p-4 bg-white rounded-xl shadow-md border-l-4 border-teal-500">
+                        <p class="font-bold mb-2">进步进展说明:</p>
+                        <p class="text-gray-600 text-sm mb-3">基于您的记录和测评数据，说明孩子的进步进展。</p>
+                        <div class="flex space-x-2">
+                            <button class="flex-1 py-2 bg-teal-500 text-white font-bold rounded-lg hover:bg-teal-600">生成周报告</button>
+                            <button class="flex-1 py-2 bg-teal-600 text-white font-bold rounded-lg hover:bg-teal-700">生成月报告</button>
+                        </div>
+                    </div>
+                    <div class="p-3 bg-gray-100 rounded-lg text-sm text-gray-600">历史记录示例: 2025/11/29: 成功完成了第一次测评，得分30分。</div>
+                </div>
+            `;
+        }
+        
+        async function saveDailyLog() {
+            // Log saving logic (omitted for brevity, same as previous version)
+            const logText = document.getElementById('daily-log-input').value.trim();
+            const logStatus = document.getElementById('log-status');
+            
+            if (!logText) { logStatus.textContent = '记录内容不能为空。'; return; }
+            if (!currentGuide || !isAuthReady) { logStatus.textContent = '档案未加载，无法保存。'; return; }
+
+            const logsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/star_guides/${currentGuide.id}/daily_logs`);
+            
+            try {
+                logStatus.textContent = '正在提交...';
+                await addDoc(logsCollectionRef, {
+                    text: logText,
+                    timestamp: serverTimestamp(),
+                    guideId: currentGuide.id
+                });
+                logStatus.textContent = '✅ 记录提交成功！';
+                document.getElementById('daily-log-input').value = '';
+                setTimeout(() => logStatus.textContent = '', 3000);
+            } catch (error) {
+                logStatus.textContent = `❌ 记录提交失败: ${error.message}`;
+            }
+        }
+
+
+        // Discussion Module (Public Data) (omitted for brevity, same as previous version)
+        function renderDiscussion(container) {
+            let discussionListHtml = discussions.map(post => `
+                <div class="p-3 bg-white rounded-lg shadow-sm border-l-4 border-gray-300">
+                    <p class="text-gray-800 font-medium">${post.text}</p>
+                    <p class="text-xs text-gray-500 mt-1">
+                        <span class="font-bold text-blue-500">${post.userName || '匿名家长'}</span> 
+                        | ${post.displayTime}
+                    </p>
+                </div>
+            `).join('');
+
+            container.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">💬 讨论交流区</h2>
+                
+                <div class="mb-6 p-4 bg-indigo-100 rounded-xl">
+                    <h3 class="text-lg font-bold text-indigo-700 mb-2">分享你的经验或建议</h3>
+                    <textarea id="discussion-input" rows="3" placeholder="分享孩子进展、软件使用建议等..." class="w-full p-2 border border-gray-300 rounded-lg mb-3 focus:ring-indigo-500"></textarea>
+                    <div class="flex justify-end items-center">
+                        <input type="text" id="discussion-username" class="w-2/5 p-2 mr-3 border border-gray-300 rounded-lg text-sm" placeholder="您的名字(可选)">
+                        <button onclick="submitDiscussionPost()" class="w-3/5 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition">
+                            发布分享
+                        </button>
+                    </div>
+                    <div id="discussion-status" class="text-sm text-center mt-2 text-gray-500"></div>
+                </div>
+
+                <h3 class="text-xl font-bold text-gray-700 mt-6 mb-3">最新讨论</h3>
+                <div id="discussion-list" class="space-y-3">
+                    ${discussionListHtml.length > 0 ? discussionListHtml : '<p class="text-gray-500">暂无讨论内容，快来成为第一个发言的人吧！</p>'}
+                </div>
+            `;
+        }
+
+        async function submitDiscussionPost() {
+            // Discussion submission logic (omitted for brevity, same as previous version)
+            const postText = document.getElementById('discussion-input').value.trim();
+            const userName = document.getElementById('discussion-username').value.trim() || '热心家长';
+            const postStatus = document.getElementById('discussion-status');
+            
+            if (!postText) { postStatus.textContent = '内容不能为空。'; return; }
+            if (!isAuthReady) { postStatus.textContent = '认证未完成，无法发布。'; return; }
+
+            const discussionRef = getDiscussionCollectionRef();
+            
+            try {
+                postStatus.textContent = '正在发布...';
+                await addDoc(discussionRef, {
+                    text: postText,
+                    userName: userName,
+                    userId: userId, 
+                    timestamp: serverTimestamp()
+                });
+                postStatus.textContent = '✅ 发布成功！';
+                document.getElementById('discussion-input').value = '';
+                document.getElementById('discussion-username').value = '';
+                setTimeout(() => postStatus.textContent = '', 3000);
+            } catch (error) {
+                postStatus.textContent = `❌ 发布失败: ${error.message}`;
+            }
+        }
+
+        // Professional Service Module (omitted for brevity, same as previous version)
+        function renderProService(container) {
+             container.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">📞 专业服务申请</h2>
+                <div class="p-4 bg-white rounded-xl shadow-md border-l-4 border-red-500 space-y-3">
+                    <h3 class="text-xl font-bold text-red-600 mb-2">⭐ 付费专业测评与指导</h3>
+                    <p class="text-lg font-semibold text-gray-800">
+                        专业测评结果：<span class="text-sm font-normal text-gray-500">(根据国内外诊断标准和环境因素)</span>
+                    </p>
+                    <ul class="list-disc list-inside space-y-2 text-gray-700 ml-4 text-base">
+                        <li>**多角度、多维度精准分析**：结合自闭症、社交障碍、智力发育迟缓等主流诊断要素。</li>
+                        <li>**定制化干预路径**：基于您的档案和测评结果，出具个体化的训练和教育方案。</li>
+                        <li>**1v1 线上专业督导**</li>
+                        <li>**30天针对性训练计划**</li>
+                    </ul>
+
+                    <div class="mt-4 pt-3 border-t border-gray-200">
+                        <p class="font-bold text-blue-600 mb-1">联系渠道：</p>
+                        <a href="mailto:pro-guidance@xingluyin.com" class="block text-blue-500 hover:text-blue-700 underline text-base">
+                            pro-guidance@xingluyin.com
+                        </a>
+                        <p class="text-sm text-gray-500 mt-2">请在邮件中附上您的用户ID，方便我们找到您的档案。</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- PROFILE CREATION MODAL & UTILS ---
+        
+        window.showProfileCreationModal = function() {
+            document.getElementById('profile-creation-modal').classList.remove('hidden');
+        }
+
+        window.submitNewProfile = async function() {
+            const name = document.getElementById('profile-name').value.trim();
+            const age = parseInt(document.getElementById('profile-age').value, 10);
+            const province = document.getElementById('profile-province').value.trim();
+            const status = document.getElementById('profile-creation-status');
+            const button = document.getElementById('profile-creation-button');
+
+            if (!name || isNaN(age) || age < 1 || !province) {
+                status.textContent = '请完整填写姓名、有效年龄和省份。';
+                return;
+            }
+            
+            if (!isAuthReady) { status.textContent = '认证未完成，请稍候。'; return; }
+
+            button.disabled = true;
+            status.innerHTML = '正在创建档案... <span class="animate-spin inline-block ml-2">🌀</span>';
+
+            const guidesRef = getGuidesCollectionRef();
+            const newGuideData = {
+                name: name,
+                age: age,
+                province: province,
+                progress: 0,
+                quote: "每一次努力，都是星星在闪烁。",
+                tasks: ["进行首次测评", "建立每日记录习惯"],
+                lastAssessmentScore: null,
+                created_at: serverTimestamp(),
+                updated_at: serverTimestamp()
+            };
+
+            try {
+                const docRef = await addDoc(guidesRef, newGuideData);
+                status.textContent = '✅ 档案创建成功！';
+                
+                currentGuide = { id: docRef.id, ...newGuideData }; 
+                
+                setTimeout(() => {
+                    document.getElementById('profile-creation-modal').classList.add('hidden');
+                    loadGuide(currentGuide.id); // Load the new guide and jump
+                    button.disabled = false;
+                }, 500);
+
+            } catch (error) {
+                status.textContent = `❌ 创建失败: ${error.message}`;
+                button.disabled = false;
+            }
+        }
+        
+        window.renderGuideList = function() {
+            const listContainer = document.getElementById('guide-list');
+            listContainer.innerHTML = ''; 
+
+            guides.forEach((guide) => {
+                const isActive = currentGuide && currentGuide.id === guide.id;
+                const listItem = document.createElement('li');
+                listItem.className = `p-2 rounded-lg cursor-pointer transition text-sm truncate ${isActive ? 'bg-blue-600 text-white font-bold' : 'bg-white text-gray-700 hover:bg-gray-200'}`;
+                listItem.textContent = `${guide.name || '未命名'} (${guide.age || '?'}岁)`;
+                listItem.onclick = () => loadGuide(guide.id);
+                listContainer.appendChild(listItem);
+            });
+        }
+        
+        window.deleteCurrentGuide = async function() {
+            if (!currentGuide || !isAuthReady) {
+                document.getElementById('error-message').textContent = '请先选择一个档案进行删除。';
+                document.getElementById('error-modal').classList.remove('hidden');
+                return;
+            }
+            document.getElementById('confirm-guide-name').textContent = currentGuide.name;
+            document.getElementById('confirmation-modal').classList.remove('hidden');
+        }
+        
+        window.performDelete = async function() {
+            document.getElementById('confirmation-modal').classList.add('hidden');
+            const guideId = currentGuide.id;
+            const guideDocRef = doc(getGuidesCollectionRef(), guideId);
+            try {
+                await deleteDoc(guideDocRef); 
+                clearGuideView();
+                if (guides.length > 0) {
+                     loadGuide(guides[0].id);
+                } else {
+                    updateAppLayout(false); // Show launch screen
+                }
+            } catch (error) {
+                console.error("删除档案失败:", error);
+                document.getElementById('error-message').textContent = '删除档案失败，请稍后重试。';
+                document.getElementById('error-modal').classList.remove('hidden');
+            }
+        }
+        
+        // Initial setup on load
+        window.onload = () => {
+            // Initially ensure launch screen is visible until auth/load decides otherwise
+             updateAppLayout(false); 
+        }
+    </script>
+
+    <style>
+        /* APP Simulation */
+        body { font-family: 'Inter', sans-serif; background-color: #e2e8f0; }
+        #app-container {
+            max-width: 500px; 
+            margin: 0 auto;
+            height: 100vh;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+            background-color: #f1f5f9;
+        }
+        .encouragement-header { background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); }
+        .custom-scroll::-webkit-scrollbar { width: 4px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background-color: #94a3b8; border-radius: 2px; }
+        .custom-scroll::-webkit-scrollbar-track { background: #f1f5f9; }
+        .modal-bg { background-color: rgba(0, 0, 0, 0.6); }
+        .nav-button:disabled { opacity: 0.6; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <!-- 主容器：模拟手机屏幕 -->
+    <div id="app-container" class="flex flex-col relative h-full">
+
+        <!-- ============================================== -->
+        <!-- A. 启动页 (50/50 布局) - 默认显示，直到档案加载 -->
+        <!-- ============================================== -->
+        <div id="launch-screen" class="absolute inset-0 flex flex-col transition duration-300">
+            <!-- 顶部 50% 鼓励语 -->
+            <div class="h-1/2 flex flex-col items-center justify-center p-8 text-white text-center encouragement-header shadow-lg">
+                <p class="text-4xl font-extrabold mb-3">💫 星路引</p>
+                <h1 class="text-xl font-light leading-relaxed">
+                    “<span class="font-semibold">耐心和爱</span>，是照亮孩子世界的引路灯。你不是一个人在战斗。”
+                </h1>
+            </div>
+
+            <!-- 底部 50% 档案操作和提示 -->
+            <div class="h-1/2 p-6 bg-white flex flex-col justify-between">
+                <div>
+                    <!-- 提示语 -->
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">🛠️ 档案管理</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        请建立孩子档案，启动您的个性化成长旅程。档案建立后将立即进入 <span class="text-blue-600 font-bold">测评模块</span>。
+                    </p>
+                    
+                    <!-- 档案列表（折叠） -->
+                    <details class="p-2 bg-gray-50 rounded-lg border border-gray-200">
+                        <summary class="font-bold text-gray-700 text-sm cursor-pointer">
+                            📂 切换历史档案...
+                        </summary>
+                        <p id="loading-state" class="text-center text-xs text-gray-400 py-2">
+                            正在加载档案...
+                        </p>
+                        <ul id="guide-list" class="space-y-1 mt-2 max-h-20 overflow-y-auto custom-scroll p-1">
+                            <!-- 档案列表将通过 JS 渲染 -->
+                        </ul>
+                    </details>
+                </div>
+
+                <!-- 底部按钮 -->
+                <div class="flex space-x-3 w-full mt-4">
+                    <button onclick="showProfileCreationModal()" class="flex-1 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-xl transition shadow-lg">
+                        + 新建档案
+                    </button>
+                    <button onclick="deleteCurrentGuide()" class="flex-1 py-3 bg-red-500 hover:bg-red-600 text-white font-bold rounded-xl transition shadow-lg">
+                        删除档案
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- ============================================== -->
+        <!-- B. 主应用界面 (仅档案加载后显示) -->
+        <!-- ============================================== -->
+
+        <!-- B.1 顶部鼓励语和状态展示区 -->
+        <div id="app-main-header" class="encouragement-header text-white p-4 sticky top-0 z-10 shadow-md hidden">
+            <div class="flex justify-between items-start mb-3">
+                <div class="flex-grow min-w-0">
+                    <h1 class="text-2xl font-bold tracking-tight truncate" id="main-quote"></h1>
+                    <p class="text-sm font-light text-blue-200 mt-1 truncate" id="quote-source"></p>
+                </div>
+            </div>
+            <!-- 进度条 -->
+            <div id="progress-container" class="mt-2 hidden">
+                <p class="text-xs font-semibold text-white mb-1">总进度: <span id="progress-text-main">0%</span></p>
+                <div class="w-full bg-gray-200/50 rounded-full h-1.5">
+                    <div id="progress-bar-main" class="progress-bar bg-gray-400 h-1.5 rounded-full" style="width: 0%"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- B.2 模块中心内容区 (可滚动) -->
+        <div id="app-main-content-wrapper" class="flex-grow p-4 overflow-y-auto custom-scroll hidden">
+            <div id="content-area-main">
+                <!-- 模块内容将渲染到这里 -->
+            </div>
+        </div>
+
+        <!-- B.3 固定底部导航栏 (4个模块) -->
+        <div id="app-main-nav" class="sticky bottom-0 w-full p-2 bg-white border-t border-gray-200 shadow-xl hidden">
+            <div class="grid grid-cols-4 gap-1">
+                <button id="nav-assessment" onclick="switchView('ASSESSMENT')" class="nav-button flex flex-col items-center justify-center text-xs py-2 bg-blue-600 text-white rounded-lg">
+                    <span class="text-lg">🧠</span> 测评
+                </button>
+                <button id="nav-daily_log" onclick="switchView('DAILY_LOG')" class="nav-button flex flex-col items-center justify-center text-xs py-2 text-gray-500 bg-white hover:bg-blue-50 rounded-lg">
+                    <span class="text-lg">📝</span> 记录
+                </button>
+                <button id="nav-discussion" onclick="switchView('DISCUSSION')" class="nav-button flex flex-col items-center justify-center text-xs py-2 text-gray-500 bg-white hover:bg-blue-50 rounded-lg">
+                    <span class="text-lg">💬</span> 讨论区
+                </button>
+                <button id="nav-pro_service" onclick="switchView('PRO_SERVICE')" class="nav-button flex flex-col items-center justify-center text-xs py-2 text-gray-500 bg-white hover:bg-blue-50 rounded-lg">
+                    <span class="text-lg">📞</span> 服务
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 档案新建 Modal -->
+    <div id="profile-creation-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center modal-bg transition duration-300">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-11/12 max-w-md">
+            <h3 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">👶 创建新档案</h3>
+            <!-- Form fields (Name, Age, Province) -->
+            <div class="space-y-3">
+                <label class="block"><span class="text-sm font-medium text-gray-600">孩子姓名/代号</span><input type="text" id="profile-name" class="mt-1 block w-full border border-gray-300 rounded-lg p-2" placeholder="例如：星星 / 小明"></label>
+                <label class="block"><span class="text-sm font-medium text-gray-600">年龄 (岁)</span><input type="number" id="profile-age" class="mt-1 block w-full border border-gray-300 rounded-lg p-2" min="1" max="18" placeholder="例如：5"></label>
+                <label class="block"><span class="text-sm font-medium text-gray-600">所在省份</span><select id="profile-province" class="mt-1 block w-full border border-gray-300 rounded-lg p-2">
+                    <option value="">-- 请选择 --</option><option value="北京">北京</option><option value="上海">上海</option><option value="广东">广东</option><option value="江苏">江苏</option><option value="浙江">浙江</option><option value="四川">四川</option><option value="湖北">湖北</option><option value="其他">其他/海外</option>
+                </select></label>
+            </div>
+            <button onclick="submitNewProfile()" id="profile-creation-button" class="mt-6 w-full py-3 bg-green-600 text-white font-bold rounded-xl hover:bg-green-700 transition">
+                创建档案并开始测评
+            </button>
+            <p id="profile-creation-status" class="text-center text-sm mt-3 text-gray-500"></p>
+        </div>
+    </div>
+    
+    <!-- 测评结果 Modal (新需求) -->
+    <div id="assessment-result-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center modal-bg transition duration-300">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-11/12 max-w-md max-h-[90vh] overflow-y-auto">
+            <h3 class="text-2xl font-bold text-blue-600 mb-4 border-b pb-2">🎉 测评结果 - 简要分析</h3>
+            
+            <div class="flex justify-between items-center mb-4 p-3 bg-blue-50 rounded-lg">
+                <p class="text-sm text-gray-600">总得分 / 满分: <span id="result-score" class="font-bold text-blue-700">0 / 36 分</span></p>
+                <p class="text-sm text-gray-600">初步定级: <span id="result-level" class="font-bold text-red-700">常规发展级</span></p>
+            </div>
+
+            <div class="space-y-4">
+                <div class="bg-gray-50 p-3 rounded-lg border">
+                    <p class="font-semibold text-gray-700 mb-1">评估结果 (100字内)</p>
+                    <p id="result-summary" class="text-sm text-gray-600 leading-relaxed"></p>
+                </div>
+                
+                <div class="bg-gray-50 p-3 rounded-lg border">
+                    <p class="font-semibold text-gray-700 mb-1">初步指导建议</p>
+                    <p id="result-guidance" class="text-sm text-gray-600 leading-relaxed"></p>
+                </div>
+            </div>
+
+            <!-- 付费测评提示 -->
+            <div class="mt-6 p-4 bg-yellow-100 rounded-xl border-l-4 border-yellow-500">
+                <p class="font-bold text-red-600 text-lg mb-1">💡 提示：升级专业测评！</p>
+                <p class="text-sm text-gray-700">
+                    自测结果仅供参考。付费专业版将结合<span class="font-bold">医院诊断、环境因素</span>等，提供更权威、更个性化的干预指导和专业督导服务。
+                </p>
+                <button onclick="document.getElementById('assessment-result-modal').classList.add('hidden'); switchView('PRO_SERVICE');" 
+                        class="mt-3 w-full py-2 bg-red-600 text-white font-bold rounded-lg hover:bg-red-700 transition">
+                    了解专业服务
+                </button>
+            </div>
+            
+            <button onclick="document.getElementById('assessment-result-modal').classList.add('hidden')" class="mt-4 w-full py-2 bg-gray-200 text-gray-700 font-bold rounded-lg hover:bg-gray-300 transition">
+                关闭并继续使用
+            </button>
+
+        </div>
+    </div>
+
+    <!-- 删除确认 Modal -->
+    <div id="confirmation-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center modal-bg transition duration-300">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-11/12 max-w-sm">
+            <h3 class="text-xl font-bold text-red-600 mb-3">❗ 确认删除</h3>
+            <p class="text-gray-700 mb-6">您确定要永久删除档案 <span class="font-bold text-red-700" id="confirm-guide-name">[档案名称]</span> 吗？</p>
+            <div class="flex justify-end space-x-3">
+                <button onclick="document.getElementById('confirmation-modal').classList.add('hidden')" class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">取消</button>
+                <button onclick="performDelete()" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">确认删除</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 错误/信息提示 Modal -->
+    <div id="error-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center modal-bg transition duration-300">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-11/12 max-w-sm">
+            <h3 class="text-xl font-bold text-yellow-600 mb-3">注意</h3>
+            <p class="text-gray-700 mb-6" id="error-message">发生了一个操作错误。</p>
+            <div class="flex justify-end">
+                <button onclick="document.getElementById('error-modal').classList.add('hidden')" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">确定</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
